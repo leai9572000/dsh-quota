@@ -1,0 +1,5 @@
+# dsh-quota bundle layer: inserts the quota plugin row.
+# The row id stays stable so re-adds and profile patches can target it.
+- insert:
+    - id: dsh-quota
+      name: dsh-quota

@@ -1,0 +1,33 @@
+{
+  "name": "dsh-quota",
+  "version": "0.1.0",
+  "description": "Local-only quota badge for DeepSeek Harness: shows the OpenCode Go subscription usage windows (5-hour / weekly / monthly) and the DeepSeek pay-as-you-go balance in the composer's bottom-right row. Credentials stay on the host half; zero third-party browser requests.",
+  "type": "module",
+  "license": "MIT",
+  "author": "leai9572000",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leai9572000/dsh-quota.git"
+  },
+  "homepage": "https://github.com/leai9572000/dsh-quota#readme",
+  "bugs": {
+    "url": "https://github.com/leai9572000/dsh-quota/issues"
+  },
+  "keywords": ["dsh-plugin", "deepseek-harness", "quota", "usage"],
+  "files": ["src/", "cordis.patch.yml", "README.md"],
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web"
+    }
+  }
+}
+
