@@ -50,6 +50,10 @@ window.__ModuleLoader__.load({
         srcOfficialHint: '百分比取自上游官方数据，与官方控制台一致，但不含小数。',
         srcLocalHint: '百分比按本机会话日志实测金额 ÷ 预算计算，含一位小数；只统计本机 DSH 流量，不含 Claude Code 等其它客户端，因此通常低于官方值。',
         srcSwitchHint: '数据源：{current}（点击切换）',
+        todayTitle: '今天',
+        requests: '{n} 次请求',
+        tokensLabel: '输入 {input} · 输出 {output} · 缓存读 {cache}',
+        peakNote: '其中 {n} 次落在高峰时段（UTC 01-04 / 06-10，周一至周五），费率翻倍。',
         deepseekTitle: 'DeepSeek 余额',
         deepseekHint: '按量付费余额，不是订阅额度',
         balance: '余额 {value}',
@@ -79,6 +83,10 @@ window.__ModuleLoader__.load({
         srcOfficialHint: 'Percentages come from the upstream API and match the official console, but are integers only.',
         srcLocalHint: 'Percentages are measured locally (spend ÷ budget, one decimal); DSH traffic only, so usually lower than the official value.',
         srcSwitchHint: 'Source: {current} (click to switch)',
+        todayTitle: 'Today',
+        requests: '{n} requests',
+        tokensLabel: 'in {input} · out {output} · cache-read {cache}',
+        peakNote: '{n} attempts fell in peak hours (UTC 01-04 / 06-10, Mon-Fri) at double rate.',
         deepseekTitle: 'DeepSeek balance',
         deepseekHint: 'Pay-as-you-go balance, not a subscription quota',
         balance: 'Balance {value}',
@@ -235,6 +243,13 @@ window.__ModuleLoader__.load({
       return `${Number.isFinite(raw) ? Math.round(raw) : 0}%`
     }
 
+    function fmtTokens(value) {
+      const n = Number(value) || 0
+      if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+      if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`
+      return String(n)
+    }
+
     function fmtUsd(value) {
       const n = Number(value)
       return `$${(Number.isFinite(n) ? n : 0).toFixed(2)}`
@@ -311,6 +326,9 @@ window.__ModuleLoader__.load({
       row: { display: 'flex', alignItems: 'center', gap: 8 },
       rowLabel: { width: 52, flex: 'none', opacity: 0.75 },
       rowValue: { width: 52, flex: 'none', textAlign: 'right', fontVariantNumeric: 'tabular-nums' },
+      rowUsd: { width: 84, flex: 'none', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 11, opacity: 0.75 },
+      todayRow: { display: 'flex', alignItems: 'baseline', gap: 8 },
+      todayValue: { fontSize: 18, fontWeight: 600, fontVariantNumeric: 'tabular-nums' },
       track: {
         position: 'relative',
         flex: 1,
@@ -377,6 +395,11 @@ window.__ModuleLoader__.load({
         )
       }
       const percent = effectivePercent(window, source)
+      // 金额只有本机模式才有：上游只返回整数百分比，不提供任何美元信息。
+      const hasUsd =
+        source === SOURCE_LOCAL &&
+        typeof window.measuredUsd === 'number' &&
+        typeof window.budgetUsd === 'number'
       return React.createElement(
         'div',
         { style: { marginBottom: 8 } },
@@ -391,6 +414,13 @@ window.__ModuleLoader__.load({
               style: { ...styles.fill, width: `${Math.min(100, percent)}%`, background: fillColor(percent) },
             }),
           ),
+          hasUsd
+            ? React.createElement(
+                'span',
+                { style: styles.rowUsd },
+                `${fmtUsd(window.measuredUsd)} / ${fmtUsd(window.budgetUsd)}`,
+              )
+            : null,
           React.createElement('span', { style: styles.rowValue }, fmtWindowPercent(window, source)),
         ),
         React.createElement(
@@ -504,6 +534,9 @@ window.__ModuleLoader__.load({
         state && state.deepseek && state.deepseek.status === 'ok' && Array.isArray(state.deepseek.balances)
           ? state.deepseek.balances[0]
           : null
+      // 本机花费（仅本机模式展示）：上游不提供金额，这部分完全来自本机统计。
+      const spend = state && state.spend && state.spend.status === 'ok' ? state.spend : null
+      const today = spend !== null && spend.today ? spend.today : null
 
       // 胶囊读数：三个窗口。
       let summary = null
@@ -595,6 +628,43 @@ window.__ModuleLoader__.load({
             ),
           ),
         ),
+
+        // 今日花费（仅本机模式：上游不提供金额）
+        (source === null ? SOURCE_OFFICIAL : source) === SOURCE_LOCAL
+          ? React.createElement(
+              'div',
+              { style: styles.group },
+              React.createElement('div', { style: styles.groupTitle }, t('todayTitle')),
+              today !== null
+                ? React.createElement(
+                    'div',
+                    null,
+                    React.createElement(
+                      'div',
+                      { style: styles.todayRow },
+                      React.createElement('span', { style: styles.todayValue }, fmtUsd(today.costUsd)),
+                      React.createElement('span', { style: styles.muted }, t('requests', { n: today.attempts })),
+                    ),
+                    React.createElement(
+                      'div',
+                      { style: styles.muted },
+                      t('tokensLabel', {
+                        input: fmtTokens(today.tokens ? today.tokens.input : 0),
+                        output: fmtTokens(today.tokens ? today.tokens.output : 0),
+                        cache: fmtTokens(today.tokens ? today.tokens.cacheRead : 0),
+                      }),
+                    ),
+                    today.peakAttempts > 0
+                      ? React.createElement(
+                          'div',
+                          { style: { ...styles.muted, fontSize: 11 } },
+                          t('peakNote', { n: today.peakAttempts }),
+                        )
+                      : null,
+                  )
+                : React.createElement('div', { style: styles.muted }, t('loading')),
+            )
+          : null,
 
         // Go 窗口额度
         React.createElement(
