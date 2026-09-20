@@ -114,6 +114,19 @@ function decodeSessionLog(buffer) {
  */
 function collectSessionFiles(root) {
   const files = []
+  /**
+   * 递归查找会话目录，每个目录只取**一个**日志文件。
+   *
+   * 为什么要去重：DSH 从某个版本起改用 `session.v3.jsonl.zstd`，而它并非增量文件，
+   * 而是同一会话的**全量重写版**——新旧两个文件的时间范围完全重叠。两个都读会把
+   * 同一份用量算两遍（实测金额直接翻倍，周窗口因此高出约 1.5 倍）。
+   *
+   * 取舍：v3 更全（覆盖到更晚的时间），所以有 v3 就用 v3；只有完全没有 v3 的
+   * 老会话才退回旧文件。
+   *
+   * @param root - `~/.dsh/sessions`。
+   * @returns 文件绝对路径数组（每个会话目录最多一个）。
+   */
   const walk = (dir) => {
     let entries
     try {
@@ -121,10 +134,17 @@ function collectSessionFiles(root) {
     } catch {
       return
     }
+    const v3 = path.join(dir, 'session.v3.jsonl.zstd')
+    const legacy = path.join(dir, 'session.jsonl.zstd')
+    const hasV3 = fs.existsSync(v3)
+    const hasLegacy = fs.existsSync(legacy)
+    if (hasV3 || hasLegacy) {
+      // 这是一个会话目录：只取一个文件，不再往下递归。
+      files.push(hasV3 ? v3 : legacy)
+      return
+    }
     for (const entry of entries) {
-      const full = path.join(dir, entry.name)
-      if (entry.isDirectory()) walk(full)
-      else if (entry.isFile() && entry.name.endsWith('.jsonl.zstd')) files.push(full)
+      if (entry.isDirectory()) walk(path.join(dir, entry.name))
     }
   }
   walk(root)
@@ -134,6 +154,30 @@ function collectSessionFiles(root) {
 /** 一个统计窗口：起算时间 + 美元/次数/token 累计。 */
 function makeBucket(since) {
   return { since, costUsd: 0, attempts: 0, peakAttempts: 0, input: 0, output: 0, cacheRead: 0 }
+}
+
+/**
+ * 把一次请求的用量累加进所有窗口。
+ *
+ * 抽出来是因为两种日志格式（旧 `assistant/chunk` 与 v3 `assistant/message`）
+ * 都要用它，避免同一段累加逻辑写两遍而走样。
+ *
+ * @param buckets - 四个窗口的累加器。
+ * @param at - 该次用量的时间（epoch 毫秒）。
+ * @param cost - 已按高峰/低谷计价好的美元金额。
+ * @param usage - `{ inputTokens, outputTokens, cacheReadTokens }`。
+ */
+function accumulate(buckets, at, cost, usage) {
+  const peak = isPeakHour(at)
+  for (const bucket of Object.values(buckets)) {
+    if (at < bucket.since) continue
+    bucket.costUsd += cost
+    bucket.attempts += 1
+    if (peak) bucket.peakAttempts += 1
+    bucket.input += Number(usage.inputTokens) || 0
+    bucket.output += Number(usage.outputTokens) || 0
+    bucket.cacheRead += Number(usage.cacheReadTokens) || 0
+  }
 }
 
 /**
@@ -207,11 +251,33 @@ export function summarizeSpend(options) {
       } catch {
         continue
       }
+      // 旧格式：request/header 建立路由，随后的 assistant/chunk 带 usage。
       if (event.type === 'request/header') {
         const config = event.data && event.data.header ? event.data.header.config : null
         route = config ? { provider: config.provider, model: config.model } : null
         continue
       }
+
+      // ── 新格式（session.v3.jsonl.zstd）──────────────────────────────────
+      // v3 把 usage 提到了事件顶层 `data.usage`，路由信息则内联在
+      // `data.message.source.{provider,model}`。注意：
+      //   · 不能用 `data.stream[].chunk.usage` —— 那是同一份数据的副本，
+      //     读它会让金额翻倍；
+      //   · provider 取自事件自身，不依赖前面是否出现过 request/header
+      //     （v3 里 request/header 极少）。
+      if (event.type === 'assistant/message') {
+        const usage = event.data ? event.data.usage : null
+        if (!usage) continue
+        if (typeof event.time !== 'number') continue
+        const message = event.data ? event.data.message : null
+        const source = message && message.source ? message.source : null
+        if (!source || source.provider !== TRACKED_PROVIDER) continue
+        if (event.time > latestEventAt) latestEventAt = event.time
+        accumulate(buckets, event.time, priceUsage(usage, isPeakHour(event.time)), usage)
+        continue
+      }
+
+      // 旧格式的 usage 载体。
       if (event.type !== 'assistant/chunk') continue
       const chunk = event.data ? event.data.chunk : null
       if (!chunk || chunk.type !== 'usage') continue
@@ -220,19 +286,7 @@ export function summarizeSpend(options) {
       // 记录统计到的最新用量时间，供界面判断数据新鲜度。
       if (event.time > latestEventAt) latestEventAt = event.time
 
-      const usage = chunk.usage || {}
-      const peak = isPeakHour(event.time)
-      const cost = priceUsage(usage, peak)
-
-      for (const bucket of Object.values(buckets)) {
-        if (event.time < bucket.since) continue
-        bucket.costUsd += cost
-        bucket.attempts += 1
-        if (peak) bucket.peakAttempts += 1
-        bucket.input += Number(usage.inputTokens) || 0
-        bucket.output += Number(usage.outputTokens) || 0
-        bucket.cacheRead += Number(usage.cacheReadTokens) || 0
-      }
+      accumulate(buckets, event.time, priceUsage(chunk.usage || {}, isPeakHour(event.time)), chunk.usage || {})
     }
   }
 
