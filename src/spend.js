@@ -112,7 +112,7 @@ function decodeSessionLog(buffer) {
  * @param root - `~/.dsh/sessions`。
  * @returns 文件绝对路径数组。
  */
-function collectSessionFiles(root) {
+function collectSessionFiles(roots) {
   const files = []
   /**
    * 递归查找会话目录，每个目录只取**一个**日志文件。
@@ -147,7 +147,7 @@ function collectSessionFiles(root) {
       if (entry.isDirectory()) walk(path.join(dir, entry.name))
     }
   }
-  walk(root)
+  for (const root of roots) walk(root)
   return files
 }
 
@@ -192,10 +192,23 @@ function accumulate(buckets, at, cost, usage) {
  */
 export function summarizeSpend(options) {
   const now = options && Number.isFinite(options.now) ? options.now : Date.now()
-  const sessionsRoot =
-    options && options.sessionsRoot
-      ? options.sessionsRoot
-      : path.join(process.env.DSH_HOME || path.join(process.env.HOME || '', '.dsh'), 'sessions')
+  // 需要统计的 sessions 根目录（可以有多个）。
+  //
+  // 为什么不止一个：备用实例（rescue）用独立的 DSH_HOME（`~/.dsh-rescue/home`），
+  // 它产生的用量记在那边的会话日志里。只扫主实例会漏掉这部分 —— 实测漏掉
+  // 过 67 次调用。所以这里把所有存在的实例目录都收集起来一起扫。
+  const sessionsRoots = (() => {
+    if (options && options.sessionsRoot) {
+      return Array.isArray(options.sessionsRoot) ? options.sessionsRoot : [options.sessionsRoot]
+    }
+    const home = process.env.HOME || ''
+    const roots = []
+    const primary = process.env.DSH_HOME || path.join(home, '.dsh')
+    roots.push(path.join(primary, 'sessions'))
+    // 约定的备用实例位置；不存在就自动跳过（collectSessionFiles 对缺失目录是宽容的）。
+    if (home) roots.push(path.join(home, '.dsh-rescue', 'home', 'sessions'))
+    return roots
+  })()
 
   const dayStart = new Date(now)
   dayStart.setHours(0, 0, 0, 0)
@@ -223,7 +236,7 @@ export function summarizeSpend(options) {
 
   // 统计到的最新用量事件时间（epoch 毫秒），0 表示没扫到任何用量。
   let latestEventAt = 0
-  const files = collectSessionFiles(sessionsRoot)
+  const files = collectSessionFiles(sessionsRoots)
   for (const file of files) {
     let stat
     try {
