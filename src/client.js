@@ -50,6 +50,8 @@ window.__ModuleLoader__.load({
         srcOfficialHint: '百分比取自上游官方数据，与官方控制台一致，但不含小数。',
         srcLocalHint: '百分比按本机会话日志实测金额 ÷ 预算计算，含一位小数；只统计本机 DSH 流量，不含 Claude Code 等其它客户端，因此通常低于官方值。',
         srcSwitchHint: '数据源：{current}（点击切换）',
+        localStaleHint: '本机统计滞后约 {n} 分钟（会话日志攒批落盘），已改用官方百分比。',
+        localStaleShort: '本机统计滞后 {n} 分钟',
         todayTitle: '今天',
         requests: '{n} 次请求',
         tokensLabel: '输入 {input} · 输出 {output} · 缓存读 {cache}',
@@ -83,6 +85,8 @@ window.__ModuleLoader__.load({
         srcOfficialHint: 'Percentages come from the upstream API and match the official console, but are integers only.',
         srcLocalHint: 'Percentages are measured locally (spend ÷ budget, one decimal); DSH traffic only, so usually lower than the official value.',
         srcSwitchHint: 'Source: {current} (click to switch)',
+        localStaleHint: 'Local stats lag by ~{n} min (logs flush in batches), so the official percentage is shown.',
+        localStaleShort: 'Local stats {n} min behind',
         todayTitle: 'Today',
         requests: '{n} requests',
         tokensLabel: 'in {input} · out {output} · cache-read {cache}',
@@ -177,6 +181,21 @@ window.__ModuleLoader__.load({
      */
     function autoPickSource(windows) {
       if (!windows) return SOURCE_OFFICIAL
+
+      // 先看数据新鲜度：会话日志是攒批落盘的，正在进行中的会话最新用量
+      // 可能还没写进日志。此时本机数字天然偏小，不能据此认为官方"不准"，
+      // 直接以官方为准（官方是权威来源，本机金额只作补充）。
+      let maxLag = 0
+      let anyStale = false
+      for (const key of ['rolling', 'weekly', 'monthly']) {
+        const w = windows[key]
+        if (!w) continue
+        if (w.localStale === true) anyStale = true
+        const lag = Number(w.lagMinutes)
+        if (Number.isFinite(lag) && lag > maxLag) maxLag = lag
+      }
+      if (anyStale) return SOURCE_OFFICIAL
+
       let maxGap = 0
       let compared = 0
       for (const key of ['rolling', 'weekly', 'monthly']) {
@@ -523,6 +542,20 @@ window.__ModuleLoader__.load({
       const go = state && state.opencodego ? state.opencodego : null
       const windows = go && go.status === 'ok' && go.windows ? go.windows : null
 
+      // 三个窗口里最大的数据滞后分钟数（后端按每个窗口给出 lagMinutes）。
+      // 用来在界面上解释「本机金额为什么偏小」，避免被误读成统计错误。
+      const maxLagMinutes = (() => {
+        if (windows === null) return null
+        let max = 0
+        for (const key of ['rolling', 'weekly', 'monthly']) {
+          const w = windows[key]
+          if (!w) continue
+          const lag = Number(w.lagMinutes)
+          if (Number.isFinite(lag) && lag > max) max = lag
+        }
+        return max > 0 ? max : null
+      })()
+
       // 首次拿到窗口数据时自动判定数据源，并记住结果（之后不再自动改）。
       useEffect(() => {
         if (source !== null || windows === null) return
@@ -671,6 +704,15 @@ window.__ModuleLoader__.load({
           'div',
           { style: styles.group },
           React.createElement('div', { style: styles.groupTitle }, t('goTitle')),
+          // 数据滞后提示：会话日志攒批落盘，正在进行的会话最新用量还没写进日志。
+          // 此时本机金额天然偏小，必须解释清楚，否则会被误读成「统计算错了」。
+          maxLagMinutes !== null && maxLagMinutes > 10
+            ? React.createElement(
+                'div',
+                { style: { ...styles.muted, fontSize: 11, marginBottom: 6 } },
+                t('localStaleHint', { n: maxLagMinutes }),
+              )
+            : null,
           windows !== null
             ? React.createElement(
                 'div',

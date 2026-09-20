@@ -125,13 +125,23 @@ function classifyThrow(error) {
  * @param local - 该窗口的本机统计（可为 undefined）。
  * @returns 归一化窗口，或 null（结构不符）。
  */
-function normalizeWindow(raw, local) {
+function normalizeWindow(raw, local, latestEventAt) {
   if (!raw || typeof raw !== 'object') return null
   const percent = percentOrNull(raw.percent)
   if (percent === null) return null
 
   const budgetUsd = typeof local === 'object' && local !== null ? local.budgetUsd : null
   const measuredUsd = typeof local === 'object' && local !== null ? local.costUsd : null
+
+  // 本机统计的数据滞后分钟数：会话日志是攒批落盘的，正在进行中的会话
+  // 最新数据可能落后几分钟到几十分钟。滞后明显时，本机金额只能当参考，
+  // 不能拿来质疑官方百分比。
+  const lagMinutes =
+    typeof latestEventAt === 'number' && latestEventAt > 0
+      ? Math.max(0, Math.round((Date.now() - latestEventAt) / 60000))
+      : null
+  // 滞后超过 10 分钟就认为本机数字已经不可靠（滚动 5 小时窗口尤其敏感）。
+  const localStale = lagMinutes !== null && lagMinutes > 10
   return {
     /** 上游给的整数百分比：权威值。 */
     percent,
@@ -148,6 +158,10 @@ function normalizeWindow(raw, local) {
       typeof measuredUsd === 'number' && typeof budgetUsd === 'number' && budgetUsd > 0
         ? Number(((measuredUsd / budgetUsd) * 100).toFixed(1))
         : null,
+    /** 本机统计相对当前时刻滞后多少分钟；null 表示没有本机数据。 */
+    lagMinutes,
+    /** 本机数据是否已滞后到不宜作为精确值展示。 */
+    localStale,
   }
 }
 
@@ -192,10 +206,11 @@ async function readOpenCodeGo(ctx, spend) {
   if (!usage || typeof usage !== 'object') return { status: 'bad-payload' }
 
   const measured = measureWindows(spend)
+  const latestEventAt = spend && typeof spend.latestEventAt === 'number' ? spend.latestEventAt : null
   const windows = {
-    rolling: normalizeWindow(usage.rolling, measured.rolling),
-    weekly: normalizeWindow(usage.weekly, measured.weekly),
-    monthly: normalizeWindow(usage.monthly, measured.monthly),
+    rolling: normalizeWindow(usage.rolling, measured.rolling, latestEventAt),
+    weekly: normalizeWindow(usage.weekly, measured.weekly, latestEventAt),
+    monthly: normalizeWindow(usage.monthly, measured.monthly, latestEventAt),
   }
   if (windows.rolling === null && windows.weekly === null && windows.monthly === null) {
     return { status: 'bad-payload' }

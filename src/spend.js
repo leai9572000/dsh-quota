@@ -177,6 +177,8 @@ export function summarizeSpend(options) {
     buckets.monthly.since,
   )
 
+  // 统计到的最新用量事件时间（epoch 毫秒），0 表示没扫到任何用量。
+  let latestEventAt = 0
   const files = collectSessionFiles(sessionsRoot)
   for (const file of files) {
     let stat
@@ -215,6 +217,8 @@ export function summarizeSpend(options) {
       if (!chunk || chunk.type !== 'usage') continue
       if (route === null || route.provider !== TRACKED_PROVIDER) continue
       if (typeof event.time !== 'number') continue
+      // 记录统计到的最新用量时间，供界面判断数据新鲜度。
+      if (event.time > latestEventAt) latestEventAt = event.time
 
       const usage = chunk.usage || {}
       const peak = isPeakHour(event.time)
@@ -247,6 +251,14 @@ export function summarizeSpend(options) {
     weekly: shape(buckets.weekly),
     monthly: shape(buckets.monthly),
     scannedFiles: files.length,
+    /**
+     * 统计到的最新一条用量事件的时间（epoch 毫秒）。
+     *
+     * 为什么需要它：DSH 是**攒批**写会话日志的，当前正在进行的会话最新数据
+     * 可能落后几分钟到几十分钟。不了解这一点，就会把「本机数字比官方小」
+     * 误当成插件算错。界面据此判断新鲜度，滞后的窗口不再冒充精确值。
+     */
+    latestEventAt,
   }
 }
 
