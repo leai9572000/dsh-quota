@@ -33,9 +33,16 @@ import { V41_WINDOW_BUDGET_USD, summarizeSpend } from './spend.js'
 
 export const name = 'dsh-quota'
 
-// webServer 是软依赖：通过 ctx.get / ctx.inject 惰性获取，
-// 这样即使服务缺失插件也只是空转，不会让整个 web 启动检查失败。
-export const inject = []
+/**
+ * webServer 是软依赖：通过 ctx.get / ctx.inject 惰性获取，
+ * 这样即使服务缺失插件也只是空转，不会让整个 web 启动检查失败。
+ *
+ * connection 是**信任栅栏**依赖：自 0.3.0 起自定义路由先用它的
+ * requestRejection(req) 拒绝伪造 Host/Origin 与未认证请求。官方插件
+ * （dsh-host-open-in-app）同样声明这个依赖，这里保持一致。
+ * 注意：声明了不等于运行时一定有 —— rejected() 对缺失仍是 fail-open。
+ */
+export const inject = ['connection']
 
 const ROUTE_PREFIX = '/__dsh-quota'
 const CACHE_TTL_MS = 60 * 1000
@@ -116,7 +123,51 @@ function classifyThrow(error) {
   return { status: timedOut ? 'timeout' : 'unreachable' }
 }
 
+/**
+ * 从响应体里提炼「业务层错误」（移植自 dsh-whale-widget 的 apiBusinessError）。
+ *
+ * 为什么必须看：有些额度/余额接口在鉴权失败或未订阅时**仍返回 HTTP 200**，
+ * 真正的错误在 body 里（如智谱的「当前用户不存在 coding plan」）。
+ * 只看 res.ok 会把这种情况当成成功，再把缺失的字段当成“结构不符”，
+ * 使用者拿到的提示就完全跑偏了。
+ *
+ * 安全约束：只回显一小段厂商错误文本（截断到 120 字），不回显完整响应体。
+ *
+ * @param data - 已解析的响应体。
+ * @returns 错误描述；无业务错误时返回空串。
+ */
+function businessError(data) {
+  if (!data || typeof data !== 'object') return ''
+  if (data.success === false || data.ok === false) {
+    return String(data.msg || data.message || data.error || 'success=false').slice(0, 120)
+  }
+  const code = Number(data.code)
+  if (Number.isFinite(code) && code !== 0 && code !== 200 && data.msg) {
+    return String(data.msg).slice(0, 120)
+  }
+  if (typeof data.error === 'string' && data.error) return data.error.slice(0, 120)
+  if (data.error && typeof data.error === 'object' && data.error.message) {
+    return String(data.error.message).slice(0, 120)
+  }
+  return ''
+}
+
 // --- 上游：OpenCode Go 额度 ---------------------------------------------------
+
+/**
+ * 从官方 `usage.<window>` 里只抽出对齐本机统计所需的两样东西。
+ *
+ * 为什么不直接用整个 raw：后续代码会把它整个传给 normalizeWindow，
+ * 这里只负责给 summarizeSpend 提供 { resetsAt } 用于反推窗口起点。
+ *
+ * @param raw - 上游 `usage.<window>` 对象。
+ * @returns `{ resetsAt }`；结构不符时返回 null。
+ */
+function readOfficialWindow(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const resetsAt = isoOrNull(raw.resetsAt)
+  return resetsAt === null ? null : { resetsAt }
+}
 
 /**
  * 把一个窗口归一化，并附上本地实测金额（上游只给整数百分比，金额来自 spend.js）。
@@ -151,13 +202,19 @@ function normalizeWindow(raw, local, latestEventAt) {
     measuredUsd,
     budgetUsd,
     /**
-     * 有本机实测金额时给出真实小数百分比（金额 ÷ 预算）；
-     * 拿不到本机数据时为 null —— 此时界面只显示上游整数，不会补零假装精度。
+     * 本机实测金额÷预算得出的参考百分比（仅用于 autoPickSource 的同口径比较）。
+     *
+     * ⚠️ 不用于界面展示：预算基数（$12/$30/$60）与官方口径对不上，这个数字
+     * 看着精确但并不准。界面百分比一律用上游官方整数，金额另外单独展示。
      */
     measuredPercent:
       typeof measuredUsd === 'number' && typeof budgetUsd === 'number' && budgetUsd > 0
         ? Number(((measuredUsd / budgetUsd) * 100).toFixed(1))
         : null,
+    /** 本机统计窗口的起算时间（ISO）；用于向使用者解释口径对齐到哪一天。 */
+    sinceAt: typeof local === 'object' && local !== null && typeof local.since === 'string'
+      ? local.since
+      : null,
     /** 本机统计相对当前时刻滞后多少分钟；null 表示没有本机数据。 */
     lagMinutes,
     /** 本机数据是否已滞后到不宜作为精确值展示。 */
@@ -202,10 +259,28 @@ async function readOpenCodeGo(ctx, spend) {
     return { status: 'bad-payload' }
   }
 
+  // HTTP 200 也可能是业务错误（key 失效 / 未订阅），先把它识别出来。
+  const bizError = businessError(payload)
+  if (bizError) return { status: 'upstream-error', httpStatus: 200, detail: bizError }
+
   const usage = payload && typeof payload === 'object' ? payload.usage : undefined
   if (!usage || typeof usage !== 'object') return { status: 'bad-payload' }
 
-  const measured = measureWindows(spend)
+  // 先抽出官方的三个窗口（含 resetsAt），再用它们去对齐本机统计的起算时间。
+  // 顺序很关键：官方 weekly 是自然周、monthly 是自然月，而本机原先用滑动 7 天 /
+  // 本地月初 —— 口径不同导致本机 weekly 多算了 6.6 天（对官方 3% 报 56.4%）。
+  const officialWindows = {
+    rolling: readOfficialWindow(usage.rolling),
+    weekly: readOfficialWindow(usage.weekly),
+    monthly: readOfficialWindow(usage.monthly),
+  }
+
+  // 本机统计需要按官方起算点重算，所以这里传入 officialWindows。
+  // 注意：调用方传进来的 spend 是按旧阈值算的，必须重算而不是复用，
+  // 否则 weekly 对齐到自然周后金额仍然是旧口径的值。
+  const measured = measureWindows(
+    summarizeSpend({ officialWindows }),
+  )
   const latestEventAt = spend && typeof spend.latestEventAt === 'number' ? spend.latestEventAt : null
   const windows = {
     rolling: normalizeWindow(usage.rolling, measured.rolling, latestEventAt),
@@ -236,7 +311,9 @@ async function readOpenCodeGo(ctx, spend) {
 function measureWindows(spend) {
   if (!spend || typeof spend !== 'object') return { rolling: null, weekly: null, monthly: null }
   const pick = (bucket, budget) =>
-    bucket && typeof bucket.costUsd === 'number' ? { costUsd: bucket.costUsd, budgetUsd: budget } : null
+    bucket && typeof bucket.costUsd === 'number'
+      ? { costUsd: bucket.costUsd, budgetUsd: budget, since: bucket.since }
+      : null
   return {
     rolling: pick(spend.rolling5h, V41_WINDOW_BUDGET_USD.rolling),
     weekly: pick(spend.weekly, V41_WINDOW_BUDGET_USD.weekly),
@@ -277,6 +354,10 @@ async function readDeepSeekBalance(ctx) {
     return { status: 'bad-payload' }
   }
 
+  // 同上：HTTP 200 也可能是业务错误（如 key 无效但接口仍回 200）。
+  const bizError = businessError(payload)
+  if (bizError) return { status: 'upstream-error', httpStatus: 200, detail: bizError }
+
   const infos = payload && Array.isArray(payload.balance_infos) ? payload.balance_infos : null
   if (infos === null) return { status: 'bad-payload' }
 
@@ -300,12 +381,20 @@ let inflight = null
 let spendCache = null // { at: number, value: object }
 
 /**
- * 取本机花费统计（带 5 分钟 TTL）。同步解压会话日志，靠 TTL 挡住绝大多数调用。
+ * 取本机花费统计（带 5 分钟 TTL）。
+ *
+ * ⚠️ v0.3.0 起界面**不再展示**本机金额，所以这里默认不计算 ——
+ * 单次 summarizeSpend 要同步解压 44 个会话日志，实测阻塞约 670ms，
+ * 而它的结果没人用。保留这个函数是为了日后需要时能一键恢复。
  *
  * @param force - 是否忽略 TTL。
- * @returns 统计结果，或 null。
+ * @returns 统计结果，或 null（未启用）。
  */
 function readSpend(force) {
+  // 开关：想恢复本机金额展示时置为 true（同时前端也要恢复相应 UI）。
+  const SHOW_LOCAL_SPEND = false
+  if (!SHOW_LOCAL_SPEND) return null
+
   if (!force && spendCache !== null && Date.now() - spendCache.at < SPEND_TTL_MS) {
     return spendCache.value
   }
@@ -327,17 +416,15 @@ function readSpend(force) {
  * @returns 快照响应体。
  */
 async function buildSnapshot(ctx, route, forceSpend) {
+  // 本机花费默认不计算（见 readSpend 的说明）：界面已不展示，而它要阻塞几百毫秒。
   const spend = readSpend(forceSpend === true)
-  const [openCodeGo, deepseek] = await Promise.all([readOpenCodeGo(ctx, spend), readDeepSeekBalance(ctx)])
+  const openCodeGo = await readOpenCodeGo(ctx, spend)
   return {
     ok: true,
     fetchedAt: new Date().toISOString(),
     ttlMs: CACHE_TTL_MS,
-    spendTtlMs: SPEND_TTL_MS,
     route: route && typeof route === 'object' ? { provider: route.provider ?? null, model: route.model ?? null } : null,
     opencodego: openCodeGo,
-    deepseek,
-    spend: spend === null ? { status: 'error' } : { status: 'ok', ...spend },
   }
 }
 
@@ -394,6 +481,45 @@ function readRoute(url) {
 // --- 插件入口 ----------------------------------------------------------------
 
 export function apply(ctx) {
+  /**
+   * 浏览器信任栅栏（移植自 dsh-whale-widget 的做法）。
+   *
+   * 为什么需要：dsh 的 connection 服务提供 requestRejection(req)，用来拒绝
+   * 伪造 Host/Origin（DNS 重绑定）或未认证的请求。我插件路由如果不走这道
+   * 判断，任意网页都能借本机同源的服务器读写 /__dsh-quota/*，把余额与额度
+   * 读走。官方插件（如 dsh-host-open-in-app）都会先调一次。
+   *
+   * 取舍：connection 不可用时选 fail-open（只 warn 一次后放行），
+   * 而不是把整个额度面板打死 —— 但会打一条 warn 以便发现“栅栏实际失效”。
+   *
+   * @param req - 请求对象。
+   * @param res - 响应对象。
+   * @returns 已拦截返回 true（响应已结束）。
+   */
+  function rejected(req, res) {
+    try {
+      // 注意取法：官方插件用 Reflect.get(ctx, 'connection')，而不是
+      // ctx.get('connection') —— 后者是惰性查找，与 cordis 注册进 ctx 的服务
+      // 不是同一个通道。照搬官方写法才能真的拿到栅栏。
+      const connection = ctx.get('connection') || Reflect.get(ctx, 'connection')
+      if (!connection || typeof connection.requestRejection !== 'function') {
+        if (!rejected.warned) {
+          rejected.warned = true
+          logLine(ctx, '[dsh-quota] 信任栅栏不可用：connection 服务缺失，自定义路由将放行处理')
+        }
+        return false
+      }
+      const code = connection.requestRejection(req)
+      if (code === undefined || code === null || code === false) return false
+      res.statusCode = typeof code === 'number' ? code : 403
+      res.end()
+      return true
+    } catch {
+      // 栅栏自身报错时不要连带把接口打挂，放行并让下游自行判断。
+      return false
+    }
+  }
+
   async function handleState(req, res) {
     try {
       sendJson(res, 200, await getSnapshot(ctx, { force: false, route: readRoute(req.url) }))
@@ -422,28 +548,34 @@ export function apply(ctx) {
       { kind: 'exact', path: `${ROUTE_PREFIX}/state`, handler: handleState },
       { kind: 'exact', path: `${ROUTE_PREFIX}/refresh`, handler: handleRefresh },
     ]) {
-      const dispose = host.register(route)
+      // 统一在这里套上信任栅栏，避免以后新增路由忘了加。
+      const inner = route.handler
+      const guarded = {
+        ...route,
+        handler: async (req, res) => {
+          if (rejected(req, res)) return
+          return inner(req, res)
+        },
+      }
+      const dispose = host.register(guarded)
       if (typeof dispose === 'function') disposers.push(dispose)
     }
-    if (typeof ctx.cleanup === 'function') {
-      ctx.cleanup(() => {
-        for (const dispose of disposers) dispose()
-      })
+    // 卸载清理：把 disposer 交给 ctx.effect 收集，而不是 ctx.cleanup。
+    // cordis 没有 ctx.cleanup —— 它的上下文是严格白名单代理，读一个未声明的属性
+    // 会直接抛 `cannot get property "cleanup" without inject`，把整棵插件树打挂
+    // （0.3.0 的启动失败就死在这一行）。注册类副作用的官方写法是
+    // `ctx.effect(() => host.register(...))`，由 effect 统一收集返回值。
+    return () => {
+      for (const dispose of disposers) dispose()
     }
   }
 
   const webServer = ctx.get('webServer')
   if (webServer !== undefined) {
-    ctx.effect(() => {
-      registerRoutes(webServer)
-      return () => {}
-    })
+    ctx.effect(() => registerRoutes(webServer))
   } else {
     ctx.inject(['webServer'], (sub) => {
-      sub.effect(() => {
-        registerRoutes(sub.webServer)
-        return () => {}
-      })
+      sub.effect(() => registerRoutes(sub.webServer))
     })
   }
 

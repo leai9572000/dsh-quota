@@ -45,20 +45,6 @@ window.__ModuleLoader__.load({
         badPayload: '上游返回结构不符',
         goTitle: 'OpenCode Go（DeepSeek V4.1 Flash）',
         goHint: '百分比取自上游官方数据，与官方控制台一致。',
-        srcOfficial: '官方',
-        srcLocal: '本机',
-        srcOfficialHint: '百分比取自上游官方数据，与官方控制台一致，但不含小数。',
-        srcLocalHint: '百分比按本机会话日志实测金额 ÷ 预算计算，含一位小数；只统计本机 DSH 流量，不含 Claude Code 等其它客户端，因此通常低于官方值。',
-        srcSwitchHint: '数据源：{current}（点击切换）',
-        localStaleHint: '本机统计滞后约 {n} 分钟（会话日志攒批落盘），已改用官方百分比。',
-        localStaleShort: '本机统计滞后 {n} 分钟',
-        todayTitle: '今天',
-        requests: '{n} 次请求',
-        tokensLabel: '输入 {input} · 输出 {output} · 缓存读 {cache}',
-        peakNote: '其中 {n} 次落在高峰时段（UTC 01-04 / 06-10，周一至周五），费率翻倍。',
-        deepseekTitle: 'DeepSeek 余额',
-        deepseekHint: '按量付费余额，不是订阅额度',
-        balance: '余额 {value}',
         openHint: '点击查看明细',
       },
       en: {
@@ -80,20 +66,6 @@ window.__ModuleLoader__.load({
         badPayload: 'Unexpected upstream payload',
         goTitle: 'OpenCode Go (DeepSeek V4.1 Flash)',
         goHint: 'Percentages come from the upstream API and match the official console.',
-        srcOfficial: 'Official',
-        srcLocal: 'Local',
-        srcOfficialHint: 'Percentages come from the upstream API and match the official console, but are integers only.',
-        srcLocalHint: 'Percentages are measured locally (spend ÷ budget, one decimal); DSH traffic only, so usually lower than the official value.',
-        srcSwitchHint: 'Source: {current} (click to switch)',
-        localStaleHint: 'Local stats lag by ~{n} min (logs flush in batches), so the official percentage is shown.',
-        localStaleShort: 'Local stats {n} min behind',
-        todayTitle: 'Today',
-        requests: '{n} requests',
-        tokensLabel: 'in {input} · out {output} · cache-read {cache}',
-        peakNote: '{n} attempts fell in peak hours (UTC 01-04 / 06-10, Mon-Fri) at double rate.',
-        deepseekTitle: 'DeepSeek balance',
-        deepseekHint: 'Pay-as-you-go balance, not a subscription quota',
-        balance: 'Balance {value}',
         openHint: 'Click for details',
       },
     }
@@ -132,86 +104,12 @@ window.__ModuleLoader__.load({
       return text
     }
 
-    // --- 数据源（官方 / 本机）-----------------------------------------------------
-
-    /** 数据源标识。 */
-    const SOURCE_OFFICIAL = 'official'
-    const SOURCE_LOCAL = 'local'
-
-    /** localStorage 键：记住用户（或自动判定）选定的数据源。 */
-    const SOURCE_KEY = 'dsh-quota:source'
-
-    /** 默认判定阈值：两个来源的百分比差额超过它就选官方（百分点）。 */
-    const AUTO_SWITCH_GAP = 1
-
-    /**
-     * 读取已保存的数据源。
-     *
-     * @returns `'official'` / `'local'`；未保存过返回 null。
-     */
-    function readSavedSource() {
-      try {
-        const raw = window.localStorage.getItem(SOURCE_KEY)
-        if (raw === SOURCE_OFFICIAL || raw === SOURCE_LOCAL) return raw
-      } catch {
-        /* localStorage 不可用（隐私模式等） */
-      }
-      return null
-    }
-
-    /** 保存数据源选择。 */
-    function saveSource(source) {
-      try {
-        window.localStorage.setItem(SOURCE_KEY, source)
-      } catch {
-        /* 忽略写入失败 */
-      }
-    }
-
-    /**
-     * 首次使用时自动判定数据源。
-     *
-     * 规则：任一侧数据缺失时用官方（官方永远权威）；
-     * 两边都有数据时，取三个窗口里「官方 − 本机」的最大差额，
-     * 超过 {@link AUTO_SWITCH_GAP} 个百分点就用官方
-     * —— 说明本机统计漏掉了其它客户端的流量，本机值不可信。
-     *
-     * @param windows - 宿主返回的三个窗口。
-     * @returns `'official'` 或 `'local'`。
-     */
-    function autoPickSource(windows) {
-      if (!windows) return SOURCE_OFFICIAL
-
-      // 先看数据新鲜度：会话日志是攒批落盘的，正在进行中的会话最新用量
-      // 可能还没写进日志。此时本机数字天然偏小，不能据此认为官方"不准"，
-      // 直接以官方为准（官方是权威来源，本机金额只作补充）。
-      let maxLag = 0
-      let anyStale = false
-      for (const key of ['rolling', 'weekly', 'monthly']) {
-        const w = windows[key]
-        if (!w) continue
-        if (w.localStale === true) anyStale = true
-        const lag = Number(w.lagMinutes)
-        if (Number.isFinite(lag) && lag > maxLag) maxLag = lag
-      }
-      if (anyStale) return SOURCE_OFFICIAL
-
-      let maxGap = 0
-      let compared = 0
-      for (const key of ['rolling', 'weekly', 'monthly']) {
-        const w = windows[key]
-        if (!w) continue
-        const official = Number(w.percent)
-        const local = Number(w.measuredPercent)
-        if (!Number.isFinite(official) || !Number.isFinite(local)) continue
-        compared += 1
-        const gap = Math.abs(official - local)
-        if (gap > maxGap) maxGap = gap
-      }
-      // 一个可比较的窗口都没有（缺上游或缺本机数据）→ 用官方。
-      if (compared === 0) return SOURCE_OFFICIAL
-      return maxGap > AUTO_SWITCH_GAP ? SOURCE_OFFICIAL : SOURCE_LOCAL
-    }
+    // 原先这里有一套「官方 / 本机」数据源切换（localStorage 记忆 + 自动判定 +
+    // 百分比取本机小数）。v0.3.0 已移除，原因：
+    //   1. 本机金额÷预算的预算基数与官方口径对不上（实测三窗口反推出的隐含预算
+    //      相差 2~2.5 倍），除出来的小数看着精确但并不准；
+    //   2. 百分比只有一个权威口径 —— 上游官方整数。
+    // 本机数据仍在宿主端计算并随快照下发（供日后需要时使用），但界面不再展示。
 
     async function fetchState(force) {
       const response = await fetch(force ? `${ROUTE}/refresh` : `${ROUTE}/state`, {
@@ -234,6 +132,9 @@ window.__ModuleLoader__.load({
         case 'timeout':
           return t('timeout')
         case 'upstream-error':
+          // 业务层错误（HTTP 200 但 body 报错）带 detail，直接展示厂商原话，
+          // 否则使用者只会看到「上游返回 200」而完全不知道发生了什么。
+          if (section.detail) return section.detail
           return t('upstreamError', { code: section.httpStatus === undefined ? '?' : section.httpStatus })
         case 'bad-payload':
           return t('badPayload')
@@ -243,35 +144,19 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 百分比：按当前数据源格式化。
+     * 百分比：**一律用官方整数**（如 "10%"）。
      *
-     * - 官方：上游整数（如 "10%"），与官方控制台一致；
-     * - 本机：实测金额 ÷ 预算（如 "9.9%"），含一位小数；
-     *   本机值缺失时退回上游整数，不补零假装精度。
+     * 为什么不再用本机金额 ÷ 预算：那个预算基数（$12/$30/$60）与官方口径对不上，
+     * 实测 rolling $0.89/12 = 7.4% 而官方 6%，weekly 更是差 50 多个百分点。
+     * 既然基数不可信，就不该拿它除出一个看似精确的百分比。
+     * 本机数据只在面板里以**金额**形式展示。
      *
      * @param window - 宿主返回的窗口对象。
-     * @param source - 当前数据源。
-     * @returns 形如 "10%" 或 "9.9%"。
+     * @returns 形如 "10%"。
      */
-    function fmtWindowPercent(window, source) {
-      if (source === SOURCE_LOCAL) {
-        const measured = Number(window.measuredPercent)
-        if (Number.isFinite(measured)) return `${measured.toFixed(1)}%`
-      }
+    function fmtWindowPercent(window) {
       const raw = Number(window.percent)
       return `${Number.isFinite(raw) ? Math.round(raw) : 0}%`
-    }
-
-    function fmtTokens(value) {
-      const n = Number(value) || 0
-      if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
-      if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`
-      return String(n)
-    }
-
-    function fmtUsd(value) {
-      const n = Number(value)
-      return `$${(Number.isFinite(n) ? n : 0).toFixed(2)}`
     }
 
     /** 剩余时间的人类可读形式（分钟 / 小时 / 天三档）。 */
@@ -345,9 +230,6 @@ window.__ModuleLoader__.load({
       row: { display: 'flex', alignItems: 'center', gap: 8 },
       rowLabel: { width: 52, flex: 'none', opacity: 0.75 },
       rowValue: { width: 52, flex: 'none', textAlign: 'right', fontVariantNumeric: 'tabular-nums' },
-      rowUsd: { width: 84, flex: 'none', textAlign: 'right', fontVariantNumeric: 'tabular-nums', fontSize: 11, opacity: 0.75 },
-      todayRow: { display: 'flex', alignItems: 'baseline', gap: 8 },
-      todayValue: { fontSize: 18, fontWeight: 600, fontVariantNumeric: 'tabular-nums' },
       track: {
         position: 'relative',
         flex: 1,
@@ -369,16 +251,6 @@ window.__ModuleLoader__.load({
         color: 'inherit',
       },
       err: { color: 'var(--dsw-alias-state-error-primary, #e5484d)' },
-      srcBtn: {
-        padding: '1px 8px',
-        fontSize: 11,
-        borderRadius: 999,
-        cursor: 'pointer',
-        border: '1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35))',
-        background: 'transparent',
-        color: 'inherit',
-        lineHeight: 1.6,
-      },
     }
 
     /** 按用量着色：低用量中性，越高越警示。 */
@@ -389,22 +261,28 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 进度条与着色用的数值。按数据源取值，本机源缺值时退回官方整数。
+     * 进度条与着色用的数值：**一律用官方整数百分比**。
+     *
+     * 不再取本机金额 ÷ 预算：预算基数不可信（见 fmtWindowPercent 的说明），
+     * 用它算出的宽度会误导。官方整数才是权威口径。
      *
      * @param window - 宿主返回的窗口对象。
-     * @param source - 当前数据源。
      * @returns 用于宽度与配色的百分数。
      */
-    function effectivePercent(window, source) {
-      if (source === SOURCE_LOCAL) {
-        const measured = Number(window.measuredPercent)
-        if (Number.isFinite(measured)) return measured
-      }
+    function effectivePercent(window) {
       const raw = Number(window.percent)
       return Number.isFinite(raw) ? raw : 0
     }
 
-    function WindowRow({ label, window, source }) {
+    /**
+     * 单个额度窗口行：进度条 + 官方百分比 + 重置倒计时。
+     *
+     * 不再接收 source 参数：百分比只有一个权威口径（上游官方整数），
+     * 本机金额与金额÷预算的小数已从界面移除（见文件上方说明）。
+     *
+     * @param props - `{ label, window }`。
+     */
+    function WindowRow({ label, window }) {
       if (!window) {
         return React.createElement(
           'div',
@@ -413,12 +291,7 @@ window.__ModuleLoader__.load({
           React.createElement('span', { style: { ...styles.muted, flex: 1 } }, '—'),
         )
       }
-      const percent = effectivePercent(window, source)
-      // 金额只有本机模式才有：上游只返回整数百分比，不提供任何美元信息。
-      const hasUsd =
-        source === SOURCE_LOCAL &&
-        typeof window.measuredUsd === 'number' &&
-        typeof window.budgetUsd === 'number'
+      const percent = effectivePercent(window)
       return React.createElement(
         'div',
         { style: { marginBottom: 8 } },
@@ -433,14 +306,7 @@ window.__ModuleLoader__.load({
               style: { ...styles.fill, width: `${Math.min(100, percent)}%`, background: fillColor(percent) },
             }),
           ),
-          hasUsd
-            ? React.createElement(
-                'span',
-                { style: styles.rowUsd },
-                `${fmtUsd(window.measuredUsd)} / ${fmtUsd(window.budgetUsd)}`,
-              )
-            : null,
-          React.createElement('span', { style: styles.rowValue }, fmtWindowPercent(window, source)),
+          React.createElement('span', { style: styles.rowValue }, fmtWindowPercent(window)),
         ),
         React.createElement(
           'div',
@@ -497,8 +363,6 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState(null)
       const [busy, setBusy] = useState(false)
       const [open, setOpen] = useState(false)
-      /** 当前数据源；null 表示尚未判定（首次拿到数据后自动选一次）。 */
-      const [source, setSource] = useState(() => readSavedSource())
       const rootRef = useRef(null)
 
       const load = useCallback(async (force) => {
@@ -542,34 +406,7 @@ window.__ModuleLoader__.load({
       const go = state && state.opencodego ? state.opencodego : null
       const windows = go && go.status === 'ok' && go.windows ? go.windows : null
 
-      // 三个窗口里最大的数据滞后分钟数（后端按每个窗口给出 lagMinutes）。
-      // 用来在界面上解释「本机金额为什么偏小」，避免被误读成统计错误。
-      const maxLagMinutes = (() => {
-        if (windows === null) return null
-        let max = 0
-        for (const key of ['rolling', 'weekly', 'monthly']) {
-          const w = windows[key]
-          if (!w) continue
-          const lag = Number(w.lagMinutes)
-          if (Number.isFinite(lag) && lag > max) max = lag
-        }
-        return max > 0 ? max : null
-      })()
 
-      // 首次拿到窗口数据时自动判定数据源，并记住结果（之后不再自动改）。
-      useEffect(() => {
-        if (source !== null || windows === null) return
-        const picked = autoPickSource(windows)
-        saveSource(picked)
-        setSource(picked)
-      }, [source, windows])
-      const balance =
-        state && state.deepseek && state.deepseek.status === 'ok' && Array.isArray(state.deepseek.balances)
-          ? state.deepseek.balances[0]
-          : null
-      // 本机花费（仅本机模式展示）：上游不提供金额，这部分完全来自本机统计。
-      const spend = state && state.spend && state.spend.status === 'ok' ? state.spend : null
-      const today = spend !== null && spend.today ? spend.today : null
 
       // 胶囊读数：三个窗口。
       let summary = null
@@ -578,8 +415,16 @@ window.__ModuleLoader__.load({
         summary = React.createElement('span', { style: { ...styles.muted, ...styles.err } }, '!')
         tone = 'var(--dsw-alias-state-error-primary, #e5484d)'
       } else if (windows !== null) {
-        const activeSource = source === null ? SOURCE_OFFICIAL : source
-        tone = fillColor(windows.monthly ? effectivePercent(windows.monthly, activeSource) : 0)
+        // 胶囊颜色取**三个窗口里百分比最高**的那个：真正的风险信号是
+        // 「哪个窗口最接近上限」，而不是固定的 monthly —— 周一刚重置时
+        // monthly 很低但 rolling/weekly 可能已经满，旧写法会把危险显示成正常。
+        const worstPercent = Math.max(
+          0,
+          ...['rolling', 'weekly', 'monthly'].map((key) =>
+            windows[key] ? effectivePercent(windows[key]) : 0,
+          ),
+        )
+        tone = fillColor(worstPercent)
         const parts = []
         for (const [key, label] of [
           ['rolling', t('window5h')],
@@ -594,7 +439,7 @@ window.__ModuleLoader__.load({
             React.createElement(
               'span',
               { key },
-              fmtWindowPercent(window, source === null ? SOURCE_OFFICIAL : source),
+              fmtWindowPercent(window),
             ),
           )
         }
@@ -631,88 +476,16 @@ window.__ModuleLoader__.load({
           React.createElement('span', { style: styles.panelTitle }, t('title')),
           React.createElement(
             'span',
-            { style: { display: 'flex', alignItems: 'center', gap: 6 } },
-            React.createElement(
-              'button',
-              {
-                type: 'button',
-                style: styles.srcBtn,
-                title: t('srcSwitchHint', {
-                  current: (source === null ? SOURCE_OFFICIAL : source) === SOURCE_OFFICIAL
-                    ? t('srcOfficial')
-                    : t('srcLocal'),
-                }),
-                onClick: () => {
-                  const next = (source === null ? SOURCE_OFFICIAL : source) === SOURCE_OFFICIAL
-                    ? SOURCE_LOCAL
-                    : SOURCE_OFFICIAL
-                  saveSource(next)
-                  setSource(next)
-                },
-              },
-              (source === null ? SOURCE_OFFICIAL : source) === SOURCE_OFFICIAL
-                ? t('srcOfficial')
-                : t('srcLocal'),
-            ),
-            React.createElement(
-              'span',
-              { style: { ...styles.muted, fontSize: 11 } },
-              state ? fmtClock(state.fetchedAt) : '—',
-            ),
+            { style: { ...styles.muted, fontSize: 11 } },
+            state ? fmtClock(state.fetchedAt) : '—',
           ),
         ),
-
-        // 今日花费（仅本机模式：上游不提供金额）
-        (source === null ? SOURCE_OFFICIAL : source) === SOURCE_LOCAL
-          ? React.createElement(
-              'div',
-              { style: styles.group },
-              React.createElement('div', { style: styles.groupTitle }, t('todayTitle')),
-              today !== null
-                ? React.createElement(
-                    'div',
-                    null,
-                    React.createElement(
-                      'div',
-                      { style: styles.todayRow },
-                      React.createElement('span', { style: styles.todayValue }, fmtUsd(today.costUsd)),
-                      React.createElement('span', { style: styles.muted }, t('requests', { n: today.attempts })),
-                    ),
-                    React.createElement(
-                      'div',
-                      { style: styles.muted },
-                      t('tokensLabel', {
-                        input: fmtTokens(today.tokens ? today.tokens.input : 0),
-                        output: fmtTokens(today.tokens ? today.tokens.output : 0),
-                        cache: fmtTokens(today.tokens ? today.tokens.cacheRead : 0),
-                      }),
-                    ),
-                    today.peakAttempts > 0
-                      ? React.createElement(
-                          'div',
-                          { style: { ...styles.muted, fontSize: 11 } },
-                          t('peakNote', { n: today.peakAttempts }),
-                        )
-                      : null,
-                  )
-                : React.createElement('div', { style: styles.muted }, t('loading')),
-            )
-          : null,
 
         // Go 窗口额度
         React.createElement(
           'div',
           { style: styles.group },
           React.createElement('div', { style: styles.groupTitle }, t('goTitle')),
-          // 数据滞后提示：会话日志攒批落盘，正在进行的会话最新用量还没写进日志。
-          // 此时本机金额天然偏小，必须解释清楚，否则会被误读成「统计算错了」。
-          maxLagMinutes !== null && maxLagMinutes > 10
-            ? React.createElement(
-                'div',
-                { style: { ...styles.muted, fontSize: 11, marginBottom: 6 } },
-                t('localStaleHint', { n: maxLagMinutes }),
-              )
-            : null,
           windows !== null
             ? React.createElement(
                 'div',
@@ -720,44 +493,24 @@ window.__ModuleLoader__.load({
                 React.createElement(WindowRow, {
                   label: t('window5h'),
                   window: windows.rolling,
-                  source: source === null ? SOURCE_OFFICIAL : source,
                 }),
                 React.createElement(WindowRow, {
                   label: t('weekly'),
                   window: windows.weekly,
-                  source: source === null ? SOURCE_OFFICIAL : source,
                 }),
                 React.createElement(WindowRow, {
                   label: t('monthly'),
                   window: windows.monthly,
-                  source: source === null ? SOURCE_OFFICIAL : source,
                 }),
               )
             : React.createElement('div', { style: styles.muted }, go === null ? t('loading') : statusText(go)),
           React.createElement(
             'div',
             { style: styles.hint },
-            (source === null ? SOURCE_OFFICIAL : source) === SOURCE_OFFICIAL
-              ? t('srcOfficialHint')
-              : t('srcLocalHint'),
+            t('goHint'),
           ),
         ),
 
-        state && state.deepseek
-          ? React.createElement(
-              'div',
-              { style: styles.group },
-              React.createElement('div', { style: styles.groupTitle }, t('deepseekTitle')),
-              balance !== null
-                ? React.createElement(
-                    'div',
-                    { style: styles.muted },
-                    t('balance', { value: `${balance.total === null ? '?' : balance.total} ${balance.currency}` }),
-                  )
-                : React.createElement('div', { style: styles.muted }, statusText(state.deepseek)),
-              React.createElement('div', { style: styles.hint }, t('deepseekHint')),
-            )
-          : null,
 
         error !== null ? React.createElement('div', { style: { ...styles.err, marginTop: 10 } }, error) : null,
         React.createElement(

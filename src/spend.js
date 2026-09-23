@@ -40,13 +40,56 @@ const RATES = {
   },
 }
 
-/** Go 计划里 V4.1 Flash 的窗口预算（月 $60 促销价）。 */
+/**
+ * Go 计划里 V4.1 Flash 的窗口预算（美元）。
+ *
+ * ⚠️ 这几个数字**只作为粗略参考**，不参与任何百分比计算 ——
+ * 实测 rolling $0.89/12 = 7.4% 却与官方 6% 对不上，weekly 更是差了 50 多个
+ * 百分点，说明预算基数与官方口径并不一致。界面因此只展示金额，不算百分比。
+ */
 export const V41_WINDOW_BUDGET_USD = { rolling: 12, weekly: 30, monthly: 60 }
 
 /** Go 的窗口长度：rolling 5 小时、weekly 7 天、monthly 按上游重置时间走。 */
 const ROLLING_WINDOW_MS = 5 * 60 * 60 * 1000
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 
+/**
+ * 由官方窗口的重置时间反推该窗口的**起始时间**，让本机统计与官方同口径。
+ *
+ * 为什么必须这么做：官方 weekly 的重置时间是**下周一 00:00 UTC**，也就是
+ * 自然周（周一到周日）；而本机原先用「最近 7 天」滑动窗口，会把上一周整周的
+ * 消耗算进本周 —— 实测多算 6.6 天（159.5 小时），本机 56.4% 对官方 3%。
+ * 两者口径不同，任何比较都无意义。
+ *
+ * 推导方式：重置时间减去一个窗口长度，就是这个窗口的起点。
+ *   rolling  resetsAt - 5h
+ *   weekly   resetsAt - 7d
+ *   monthly  resetsAt - 1 个月（自然月，逐月回退并夹住月末溢出）
+ *
+ * @param resetsAt - 官方返回的重置时间（ISO 字符串或 epoch 毫秒）。
+ * @param window - `'rolling'` / `'weekly'` / `'monthly'`。
+ * @returns 起始时间（epoch 毫秒）；无法解析时返回 null（调用方回退到滑动窗口）。
+ */
+export function windowStartFrom(resetsAt, window) {
+  const at = typeof resetsAt === 'number' ? resetsAt : Date.parse(String(resetsAt || ''))
+  if (!Number.isFinite(at)) return null
+  if (window === 'rolling') return at - ROLLING_WINDOW_MS
+  if (window === 'weekly') return at - WEEK_MS
+  if (window === 'monthly') {
+    // 自然月回退：先把日期挪到上个月的同一日，再夹住月末溢出
+    // （3/31 回退一个月不该落到 3/3）。
+    const end = new Date(at)
+    const targetMonth = end.getUTCMonth() - 1
+    const day = end.getUTCDate()
+    const shifted = new Date(Date.UTC(end.getUTCFullYear(), targetMonth, 1,
+      end.getUTCHours(), end.getUTCMinutes(), end.getUTCSeconds(), end.getUTCMilliseconds()))
+    // 下个月的 0 号 = 上个月最后一天，用来夹住日期。
+    const lastDay = new Date(Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, 0)).getUTCDate()
+    shifted.setUTCDate(Math.min(day, lastDay))
+    return shifted.getTime()
+  }
+  return null
+}
 /**
  * 该时刻是否处于高峰计价时段。
  *
@@ -213,18 +256,29 @@ export function summarizeSpend(options) {
   const dayStart = new Date(now)
   dayStart.setHours(0, 0, 0, 0)
 
-  // 起算时间：今日是本地 00:00，其余按窗口长度回推。
+  // 起算时间：
+  //   today     本地 00:00
+  //   rolling5h 最近 5 小时（与官方 resetsAt - 5h 天然一致）
+  //   weekly    官方 resetsAt 反推（自然周）；拿不到官方时间才回退滑动 7 天
+  //   monthly   官方 resetsAt 反推（自然月）；拿不到则回退本地月初
+  //
+  // 为什么要让调用方传入官方窗口时间：官方 weekly 是自然周、monthly 是自然月，
+  // 而滑动 7 天 / 本地月初与它们并不等价，直接比较会得出荒谬结论。
+  const official = (options && options.officialWindows) || null
+  const aligned = (name, fallback) => {
+    const w = official && official[name]
+    const start = w ? windowStartFrom(w.resetsAt, name) : null
+    return start === null ? fallback : start
+  }
   const buckets = {
     today: makeBucket(dayStart.getTime()),
     rolling5h: makeBucket(now - ROLLING_WINDOW_MS),
-    weekly: makeBucket(now - WEEK_MS),
-    monthly: makeBucket(dayStart.getTime()), // 与"本月"近似：对齐到本地月初
+    weekly: makeBucket(aligned('weekly', now - WEEK_MS)),
+    monthly: makeBucket(aligned('monthly', dayStart.getTime())),
   }
-  // monthly 单独对齐到本地本月 1 日 00:00，避免用 dayStart 冒充。
-  const monthStart = new Date(now)
-  monthStart.setDate(1)
-  monthStart.setHours(0, 0, 0, 0)
-  buckets.monthly.since = monthStart.getTime()
+  // rolling 也优先对齐官方：官方 5 小时窗口的起点可能因会话延长而略早于 now-5h。
+  const rollingAligned = aligned('rolling', now - ROLLING_WINDOW_MS)
+  if (rollingAligned < buckets.rolling5h.since) buckets.rolling5h.since = rollingAligned
 
   // 最早的起算点：早于它的文件一定没有任何窗口的数据，可以直接跳过。
   const earliest = Math.min(
