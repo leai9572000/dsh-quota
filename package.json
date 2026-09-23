@@ -1,6 +1,6 @@
 {
   "name": "dsh-quota",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local-only quota badge for DeepSeek Harness: shows the OpenCode Go subscription usage windows (5-hour / weekly / monthly) in the composer's bottom-right row. Credentials stay on the host half; zero third-party browser requests.",
   "type": "module",
   "license": "MIT",

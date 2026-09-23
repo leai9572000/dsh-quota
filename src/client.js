@@ -46,6 +46,11 @@ window.__ModuleLoader__.load({
         goTitle: 'OpenCode Go（DeepSeek V4.1 Flash）',
         goHint: '百分比取自上游官方数据，与官方控制台一致。',
         openHint: '点击查看明细',
+        localTitle: '本机今日花费',
+        localHint: '按 OpenCode Go 的单价表估算，只统计本机 DSH 的流量。其它电脑上的 DSH 用量不在其中。',
+        localToday: '今天',
+        localOffline: '本机统计不可用',
+        localStale: '本机统计滞后约 {n} 分钟（会话日志攒批落盘）',
       },
       en: {
         label: 'Quota',
@@ -67,6 +72,11 @@ window.__ModuleLoader__.load({
         goTitle: 'OpenCode Go (DeepSeek V4.1 Flash)',
         goHint: 'Percentages come from the upstream API and match the official console.',
         openHint: 'Click for details',
+        localTitle: 'Today on this machine',
+        localHint: 'Estimated with the OpenCode Go rate card. Counts DSH traffic on this machine only; usage from your other computers is not included.',
+        localToday: 'Today',
+        localOffline: 'Local stats unavailable',
+        localStale: 'Local stats lag by ~{n} min (session logs flush in batches)',
       },
     }
 
@@ -109,7 +119,8 @@ window.__ModuleLoader__.load({
     //   1. 本机金额÷预算的预算基数与官方口径对不上（实测三窗口反推出的隐含预算
     //      相差 2~2.5 倍），除出来的小数看着精确但并不准；
     //   2. 百分比只有一个权威口径 —— 上游官方整数。
-    // 本机数据仍在宿主端计算并随快照下发（供日后需要时使用），但界面不再展示。
+    // 本机数据由宿主端计算并随快照下发，v0.3.1 起在面板里以**金额**形式展示
+    // （见 LocalSpendGroup）：比率用官方、绝对值用本机，两者不混算。
 
     async function fetchState(force) {
       const response = await fetch(force ? `${ROUTE}/refresh` : `${ROUTE}/state`, {
@@ -182,6 +193,28 @@ window.__ModuleLoader__.load({
       return `${pad(d.getHours())}:${pad(d.getMinutes())}`
     }
 
+    /**
+     * 美元金额格式化（本机分组专用）。
+     *
+     * 为什么要分档：本机单窗口金额跨度很大 —— 5 小时窗口常见 $0.4，
+     * 月度可能到十几刀。固定两位小数会让 $0.0012 显示成 $0.00（看着像没花钱），
+     * 固定四位小数又让 $12.5871 显得过于精确。所以按量级选精度。
+     *
+     * @param value - 美元金额。
+     * @returns 形如 `$0.43` / `$0.0012` / `$12.59`。
+     */
+    function fmtUsd(value) {
+      // 显式挡掉 null/''/布尔：Number(null) === 0，不挡会让「没有数据」显示成 $0
+      // （看着像「这窗口一分钱没花」，与真实语义「没算出来」完全不同）。
+      if (typeof value !== 'number' && typeof value !== 'string') return '—'
+      if (value === '') return '—'
+      const amount = Number(value)
+      if (!Number.isFinite(amount) || amount < 0) return '—'
+      if (amount === 0) return '$0'
+      if (amount < 0.01) return `$${amount.toFixed(4)}`
+      return `$${amount.toFixed(2)}`
+    }
+
     // --- 样式（只用主题变量，跟随明暗）--------------------------------------------
 
     const styles = {
@@ -251,6 +284,24 @@ window.__ModuleLoader__.load({
         color: 'inherit',
       },
       err: { color: 'var(--dsw-alias-state-error-primary, #e5484d)' },
+      // 本机分组的「金额行」：标签左、金额右，中间用点线撑开，扫一眼就能对账。
+      amountRow: {
+        display: 'flex',
+        alignItems: 'baseline',
+        gap: 8,
+        padding: '2px 0',
+      },
+      amountLabel: { flex: 'none', opacity: 0.75 },
+      amountDots: {
+        flex: 1,
+        borderBottom: '1px dotted var(--dsw-alias-border-l1, rgba(128,128,128,.3))',
+        transform: 'translateY(-3px)',
+      },
+      amount: {
+        flex: 'none',
+        fontVariantNumeric: 'tabular-nums',
+        fontWeight: 600,
+      },
     }
 
     /** 按用量着色：低用量中性，越高越警示。 */
@@ -316,6 +367,79 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * 一行「标签 ─── 金额」的对账行。
+     *
+     * @param props - `{ label, value }`。
+     */
+    function AmountRow({ label, value }) {
+      return React.createElement(
+        'div',
+        { style: styles.amountRow },
+        React.createElement('span', { style: styles.amountLabel }, label),
+        React.createElement('span', { style: styles.amountDots }),
+        React.createElement('span', { style: styles.amount }, value),
+      )
+    }
+
+    /**
+     * 「本机今日花费」分组：只用**美刀金额**展示本机今天的花费，不画进度条、不算百分比。
+     *
+     * 为什么只给金额、不给百分比：预算基数（$12 / $30 / $60）虽然取自官方文档，
+     * 但实测把本机金额除以它得到的百分比与官方对不上（官方 rolling 6% 而本机
+     * $0.89/12 = 7.4%，weekly 更差 50 多个百分点），说明本机统计口径与官方并不一致
+     * （本机只覆盖 DSH 流量，且缓存读占绝对多数）。既然比率不可信，就只给绝对金额。
+     *
+     * 为什么单位用美刀：与上方 OpenCode Go 的额度口径统一（Go 的限额本身就是
+     * 美元定义的 —— 5 小时 = 月限额 20%、周 = 50%、月 = 100%）。
+     *
+     * 为什么只有「今天」一个值：额度是本机局域网外的订阅总量，换一台电脑跑 DSH
+     * 就无从得知那台机器花了多少，所以多窗口的本机金额没有可对照的意义；
+     * 「今天花了多少」是使用者唯一真正关心的、且本机完全可知的绝对值。
+     *
+     * @param props - `{ spend }`，即宿主快照里的 `spend` 字段。
+     */
+    function LocalSpendGroup({ spend }) {
+      // 三种异常都要各自成句，否则使用者看到空白会以为插件坏了：
+      //   spend 为 null       → 宿主没算（统计失败或还没跑完）
+      //   latestEventAt 为 0  → 跑了，但一条 Go 用量都没扫到
+      //   滞后 > 10 分钟      → 数据是旧的（DSH 攒批落盘），必须明说
+      let body
+      if (!spend || typeof spend !== 'object') {
+        body = React.createElement('div', { style: styles.muted }, t('localOffline'))
+      } else {
+        const lagMinutes = (() => {
+          const at = Number(spend.latestEventAt)
+          if (!Number.isFinite(at) || at <= 0) return null
+          return Math.max(0, Math.round((Date.now() - at) / 60000))
+        })()
+        const bucket = spend.today
+        body = React.createElement(
+          'div',
+          null,
+          React.createElement(AmountRow, {
+            label: t('localToday'),
+            value: bucket && typeof bucket === 'object' ? fmtUsd(bucket.costUsd) : '—',
+          }),
+          // 滞后提示只在真的滞后时才出现，正常情况不占版面。
+          lagMinutes !== null && lagMinutes > 10
+            ? React.createElement(
+                'div',
+                { style: { ...styles.muted, fontSize: 11, marginTop: 4 } },
+                t('localStale', { n: lagMinutes }),
+              )
+            : null,
+        )
+      }
+
+      return React.createElement(
+        'div',
+        { style: styles.group },
+        React.createElement('div', { style: styles.groupTitle }, t('localTitle')),
+        body,
+        React.createElement('div', { style: styles.hint }, t('localHint')),
+      )
+    }
     /**
      * 错误边界：插件渲染或运行时抛错时兜底，避免拖垮 composer 整棵子树。
      *
@@ -511,6 +635,8 @@ window.__ModuleLoader__.load({
           ),
         ),
 
+        // 本机今日花费（美刀）：绝对值口径，与上方官方百分比并列但互不换算。
+        React.createElement(LocalSpendGroup, { spend: state ? state.spend : null }),
 
         error !== null ? React.createElement('div', { style: { ...styles.err, marginTop: 10 } }, error) : null,
         React.createElement(

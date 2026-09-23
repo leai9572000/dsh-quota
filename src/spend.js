@@ -270,11 +270,16 @@ export function summarizeSpend(options) {
     const start = w ? windowStartFrom(w.resetsAt, name) : null
     return start === null ? fallback : start
   }
+  // 「本月」的回退起点：本地当月 1 日 00:00。
+  // 注意不能拿 dayStart 冒充 —— 那是今天 0 点，会让「本月」退化成「今天」。
+  const monthStart = new Date(now)
+  monthStart.setDate(1)
+  monthStart.setHours(0, 0, 0, 0)
   const buckets = {
     today: makeBucket(dayStart.getTime()),
     rolling5h: makeBucket(now - ROLLING_WINDOW_MS),
     weekly: makeBucket(aligned('weekly', now - WEEK_MS)),
-    monthly: makeBucket(aligned('monthly', dayStart.getTime())),
+    monthly: makeBucket(aligned('monthly', monthStart.getTime())),
   }
   // rolling 也优先对齐官方：官方 5 小时窗口的起点可能因会话延长而略早于 now-5h。
   const rollingAligned = aligned('rolling', now - ROLLING_WINDOW_MS)

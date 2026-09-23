@@ -383,23 +383,26 @@ let spendCache = null // { at: number, value: object }
 /**
  * 取本机花费统计（带 5 分钟 TTL）。
  *
- * ⚠️ v0.3.0 起界面**不再展示**本机金额，所以这里默认不计算 ——
- * 单次 summarizeSpend 要同步解压 44 个会话日志，实测阻塞约 670ms，
- * 而它的结果没人用。保留这个函数是为了日后需要时能一键恢复。
+ * ⚠️ v0.3.0 曾默认关闭（界面不展示本机金额），v0.3.1 起重新启用：
+ * 面板新增「本机今日花费」一行，用美刀展示本机今天的实际花费。
+ *
+ * 单次要同步解压约 50 个会话日志，实测阻塞约 800ms，所以靠 5 分钟 TTL
+ * 挡住绝大多数调用，只有 TTL 过期或用户点「刷新」才会重算。
+ *
+ * 只回传「今天」一个窗口：面板只需要今日金额（多窗口的本机值其它电脑无从得知，
+ * 没有对照意义），少传三个窗口也省一点序列化开销。
  *
  * @param force - 是否忽略 TTL。
- * @returns 统计结果，或 null（未启用）。
+ * @returns `{ today, latestEventAt }`；失败或没有数据时返回 null。
  */
 function readSpend(force) {
-  // 开关：想恢复本机金额展示时置为 true（同时前端也要恢复相应 UI）。
-  const SHOW_LOCAL_SPEND = false
-  if (!SHOW_LOCAL_SPEND) return null
-
   if (!force && spendCache !== null && Date.now() - spendCache.at < SPEND_TTL_MS) {
     return spendCache.value
   }
+
   try {
-    const value = summarizeSpend({})
+    const all = summarizeSpend({})
+    const value = { today: all.today, latestEventAt: all.latestEventAt }
     spendCache = { at: Date.now(), value }
     return value
   } catch {
@@ -416,7 +419,7 @@ function readSpend(force) {
  * @returns 快照响应体。
  */
 async function buildSnapshot(ctx, route, forceSpend) {
-  // 本机花费默认不计算（见 readSpend 的说明）：界面已不展示，而它要阻塞几百毫秒。
+  // 本机今日花费：带 5 分钟 TTL，只有 TTL 过期或用户点刷新才会重算（约 800ms）。
   const spend = readSpend(forceSpend === true)
   const openCodeGo = await readOpenCodeGo(ctx, spend)
   return {
@@ -425,6 +428,7 @@ async function buildSnapshot(ctx, route, forceSpend) {
     ttlMs: CACHE_TTL_MS,
     route: route && typeof route === 'object' ? { provider: route.provider ?? null, model: route.model ?? null } : null,
     opencodego: openCodeGo,
+    spend,
   }
 }
 
